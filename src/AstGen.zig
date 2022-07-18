@@ -812,6 +812,7 @@ fn expr(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) InnerEr
 
         .deref => {
             const lhs = try expr(gz, scope, .none, node_datas[node].lhs);
+            _ = try gz.addUnNode(.validate_deref, lhs, node);
             switch (rl) {
                 .ref => return lhs,
                 else => {
@@ -1319,7 +1320,10 @@ fn arrayInitExpr(
                 const len_inst = try gz.addInt(array_init.ast.elements.len);
                 const elem_type = try typeExpr(gz, scope, array_type.ast.elem_type);
                 if (array_type.ast.sentinel == 0) {
-                    const array_type_inst = try gz.addBin(.array_type, len_inst, elem_type);
+                    const array_type_inst = try gz.addPlNode(.array_type, array_init.ast.type_expr, Zir.Inst.Bin{
+                        .lhs = len_inst,
+                        .rhs = elem_type,
+                    });
                     break :inst .{
                         .array = array_type_inst,
                         .elem = elem_type,
@@ -1476,7 +1480,7 @@ fn arrayInitExprRlPtr(
         return arrayInitExprRlPtrInner(gz, scope, node, base_ptr, elements);
     }
 
-    var as_scope = try gz.makeCoercionScope(scope, array_ty, result_ptr);
+    var as_scope = try gz.makeCoercionScope(scope, array_ty, result_ptr, node);
     defer as_scope.unstack();
 
     const result = try arrayInitExprRlPtrInner(&as_scope, scope, node, as_scope.rl_ptr, elements);
@@ -1552,7 +1556,10 @@ fn structInitExpr(
             if (is_inferred_array_len) {
                 const elem_type = try typeExpr(gz, scope, array_type.ast.elem_type);
                 const array_type_inst = if (array_type.ast.sentinel == 0) blk: {
-                    break :blk try gz.addBin(.array_type, .zero_usize, elem_type);
+                    break :blk try gz.addPlNode(.array_type, struct_init.ast.type_expr, Zir.Inst.Bin{
+                        .lhs = .zero_usize,
+                        .rhs = elem_type,
+                    });
                 } else blk: {
                     const sentinel = try comptimeExpr(gz, scope, .{ .ty = elem_type }, array_type.ast.sentinel);
                     break :blk try gz.addPlNode(
@@ -1697,7 +1704,7 @@ fn structInitExprRlPtr(
     const ty_inst = try typeExpr(gz, scope, struct_init.ast.type_expr);
     _ = try gz.addUnNode(.validate_struct_init_ty, ty_inst, node);
 
-    var as_scope = try gz.makeCoercionScope(scope, ty_inst, result_ptr);
+    var as_scope = try gz.makeCoercionScope(scope, ty_inst, result_ptr, node);
     defer as_scope.unstack();
 
     const result = try structInitExprRlPtrInner(&as_scope, scope, node, struct_init, as_scope.rl_ptr);
@@ -2331,8 +2338,6 @@ fn unusedResultExpr(gz: *GenZir, scope: *Scope, statement: Ast.Node.Index) Inner
             .error_union_type,
             .bit_not,
             .error_value,
-            .error_to_int,
-            .int_to_error,
             .slice_start,
             .slice_end,
             .slice_sentinel,
@@ -2419,7 +2424,6 @@ fn unusedResultExpr(gz: *GenZir, scope: *Scope, statement: Ast.Node.Index) Inner
             .splat,
             .reduce,
             .shuffle,
-            .select,
             .atomic_load,
             .atomic_rmw,
             .mul_add,
@@ -2466,6 +2470,7 @@ fn unusedResultExpr(gz: *GenZir, scope: *Scope, statement: Ast.Node.Index) Inner
             .repeat,
             .repeat_inline,
             .panic,
+            .panic_comptime,
             => {
                 noreturn_src_node = statement;
                 break :b true;
@@ -2500,6 +2505,7 @@ fn unusedResultExpr(gz: *GenZir, scope: *Scope, statement: Ast.Node.Index) Inner
             .memset,
             .validate_array_init_ty,
             .validate_struct_init_ty,
+            .validate_deref,
             => break :b true,
         }
     } else switch (maybe_unused_result) {
@@ -2753,7 +2759,10 @@ fn varDecl(
                 const result_loc: ResultLoc = if (type_node != 0) .{
                     .ty = try typeExpr(gz, scope, type_node),
                 } else .none;
+                const prev_anon_name_strategy = gz.anon_name_strategy;
+                gz.anon_name_strategy = .dbg_var;
                 const init_inst = try reachableExpr(gz, scope, result_loc, var_decl.ast.init_node, node);
+                gz.anon_name_strategy = prev_anon_name_strategy;
 
                 try gz.addDbgVar(.dbg_var_val, ident_name, init_inst);
 
@@ -2777,6 +2786,7 @@ fn varDecl(
             var init_scope = gz.makeSubBlock(scope);
             // we may add more instructions to gz before stacking init_scope
             init_scope.instructions_top = GenZir.unstacked_top;
+            init_scope.anon_name_strategy = .dbg_var;
             defer init_scope.unstack();
 
             var resolve_inferred_alloc: Zir.Inst.Ref = .none;
@@ -2956,7 +2966,10 @@ fn varDecl(
                 resolve_inferred_alloc = alloc;
                 break :a .{ .alloc = alloc, .result_loc = .{ .inferred_ptr = alloc } };
             };
+            const prev_anon_name_strategy = gz.anon_name_strategy;
+            gz.anon_name_strategy = .dbg_var;
             _ = try reachableExprComptime(gz, scope, var_data.result_loc, var_decl.ast.init_node, node, is_comptime);
+            gz.anon_name_strategy = prev_anon_name_strategy;
             if (resolve_inferred_alloc != .none) {
                 _ = try gz.addUnNode(.resolve_inferred_alloc, resolve_inferred_alloc, node);
             }
@@ -3091,6 +3104,10 @@ fn ptrType(
     node: Ast.Node.Index,
     ptr_info: Ast.full.PtrType,
 ) InnerError!Zir.Inst.Ref {
+    if (ptr_info.size == .C and ptr_info.allowzero_token != null) {
+        return gz.astgen.failTok(ptr_info.allowzero_token.?, "C pointers always allow address zero", .{});
+    }
+
     const elem_type = try typeExpr(gz, scope, ptr_info.ast.child_type);
 
     const simple = ptr_info.ast.align_node == 0 and
@@ -3196,7 +3213,10 @@ fn arrayType(gz: *GenZir, scope: *Scope, rl: ResultLoc, node: Ast.Node.Index) !Z
     const len = try expr(gz, scope, .{ .coerced_ty = .usize_type }, len_node);
     const elem_type = try typeExpr(gz, scope, node_datas[node].rhs);
 
-    const result = try gz.addBin(.array_type, len, elem_type);
+    const result = try gz.addPlNode(.array_type, node, Zir.Inst.Bin{
+        .lhs = len,
+        .rhs = elem_type,
+    });
     return rvalue(gz, rl, result, node);
 }
 
@@ -4128,7 +4148,6 @@ fn structDeclInner(
             .src_node = node,
             .layout = layout,
             .fields_len = 0,
-            .body_len = 0,
             .decls_len = 0,
             .known_non_opv = false,
             .known_comptime_only = false,
@@ -4172,6 +4191,19 @@ fn structDeclInner(
     var wip_members = try WipMembers.init(gpa, &astgen.scratch, decl_count, field_count, bits_per_field, max_field_size);
     defer wip_members.deinit();
 
+    // We will use the scratch buffer, starting here, for the bodies:
+    //    bodies: { // for every fields_len
+    //        field_type_body_inst: Inst, // for each field_type_body_len
+    //        align_body_inst: Inst, // for each align_body_len
+    //        init_body_inst: Inst, // for each init_body_len
+    //    }
+    // Note that the scratch buffer is simultaneously being used by WipMembers, however
+    // it will not access any elements beyond this point in the ArrayList. It also
+    // accesses via the ArrayList items field so it can handle the scratch buffer being
+    // reallocated.
+    // No defer needed here because it is handled by `wip_members.deinit()` above.
+    const bodies_start = astgen.scratch.items.len;
+
     var known_non_opv = false;
     var known_comptime_only = false;
     for (container_decl.ast.members) |member_node| {
@@ -4183,20 +4215,18 @@ fn structDeclInner(
         const field_name = try astgen.identAsString(member.ast.name_token);
         wip_members.appendToField(field_name);
 
+        const doc_comment_index = try astgen.docCommentAsString(member.firstToken());
+        wip_members.appendToField(doc_comment_index);
+
         if (member.ast.type_expr == 0) {
             return astgen.failTok(member.ast.name_token, "struct field missing type", .{});
         }
 
         const field_type = try typeExpr(&block_scope, &namespace.base, member.ast.type_expr);
-        wip_members.appendToField(@enumToInt(field_type));
-
-        const doc_comment_index = try astgen.docCommentAsString(member.firstToken());
-        wip_members.appendToField(doc_comment_index);
-
+        const have_type_body = !block_scope.isEmpty();
         const have_align = member.ast.align_expr != 0;
         const have_value = member.ast.value_expr != 0;
         const is_comptime = member.comptime_token != null;
-        const unused = false;
 
         if (!is_comptime) {
             known_non_opv = known_non_opv or
@@ -4204,36 +4234,59 @@ fn structDeclInner(
             known_comptime_only = known_comptime_only or
                 nodeImpliesComptimeOnly(tree, member.ast.type_expr);
         }
-        wip_members.nextField(bits_per_field, .{ have_align, have_value, is_comptime, unused });
+        wip_members.nextField(bits_per_field, .{ have_align, have_value, is_comptime, have_type_body });
+
+        if (have_type_body) {
+            if (!block_scope.endsWithNoReturn()) {
+                _ = try block_scope.addBreak(.break_inline, decl_inst, field_type);
+            }
+            const body = block_scope.instructionsSlice();
+            const old_scratch_len = astgen.scratch.items.len;
+            try astgen.scratch.ensureUnusedCapacity(gpa, countBodyLenAfterFixups(astgen, body));
+            appendBodyWithFixupsArrayList(astgen, &astgen.scratch, body);
+            wip_members.appendToField(@intCast(u32, astgen.scratch.items.len - old_scratch_len));
+            block_scope.instructions.items.len = block_scope.instructions_top;
+        } else {
+            wip_members.appendToField(@enumToInt(field_type));
+        }
 
         if (have_align) {
             if (layout == .Packed) {
                 try astgen.appendErrorNode(member.ast.align_expr, "unable to override alignment of packed struct fields", .{});
             }
-            const align_inst = try expr(&block_scope, &namespace.base, align_rl, member.ast.align_expr);
-            wip_members.appendToField(@enumToInt(align_inst));
+            const align_ref = try expr(&block_scope, &namespace.base, coerced_align_rl, member.ast.align_expr);
+            if (!block_scope.endsWithNoReturn()) {
+                _ = try block_scope.addBreak(.break_inline, decl_inst, align_ref);
+            }
+            const body = block_scope.instructionsSlice();
+            const old_scratch_len = astgen.scratch.items.len;
+            try astgen.scratch.ensureUnusedCapacity(gpa, countBodyLenAfterFixups(astgen, body));
+            appendBodyWithFixupsArrayList(astgen, &astgen.scratch, body);
+            wip_members.appendToField(@intCast(u32, astgen.scratch.items.len - old_scratch_len));
+            block_scope.instructions.items.len = block_scope.instructions_top;
         }
+
         if (have_value) {
-            const rl: ResultLoc = if (field_type == .none) .none else .{ .ty = field_type };
+            const rl: ResultLoc = if (field_type == .none) .none else .{ .coerced_ty = field_type };
 
             const default_inst = try expr(&block_scope, &namespace.base, rl, member.ast.value_expr);
-            wip_members.appendToField(@enumToInt(default_inst));
+            if (!block_scope.endsWithNoReturn()) {
+                _ = try block_scope.addBreak(.break_inline, decl_inst, default_inst);
+            }
+            const body = block_scope.instructionsSlice();
+            const old_scratch_len = astgen.scratch.items.len;
+            try astgen.scratch.ensureUnusedCapacity(gpa, countBodyLenAfterFixups(astgen, body));
+            appendBodyWithFixupsArrayList(astgen, &astgen.scratch, body);
+            wip_members.appendToField(@intCast(u32, astgen.scratch.items.len - old_scratch_len));
+            block_scope.instructions.items.len = block_scope.instructions_top;
         } else if (member.comptime_token) |comptime_token| {
             return astgen.failTok(comptime_token, "comptime field without default initialization value", .{});
         }
     }
 
-    if (!block_scope.isEmpty()) {
-        _ = try block_scope.addBreak(.break_inline, decl_inst, .void_value);
-    }
-
-    const body = block_scope.instructionsSlice();
-    const body_len = astgen.countBodyLenAfterFixups(body);
-
     try gz.setStruct(decl_inst, .{
         .src_node = node,
         .layout = layout,
-        .body_len = body_len,
         .fields_len = field_count,
         .decls_len = decl_count,
         .known_non_opv = known_non_opv,
@@ -4243,10 +4296,11 @@ fn structDeclInner(
     wip_members.finishBits(bits_per_field);
     const decls_slice = wip_members.declsSlice();
     const fields_slice = wip_members.fieldsSlice();
-    try astgen.extra.ensureUnusedCapacity(gpa, decls_slice.len + body_len + fields_slice.len);
+    const bodies_slice = astgen.scratch.items[bodies_start..];
+    try astgen.extra.ensureUnusedCapacity(gpa, decls_slice.len + fields_slice.len + bodies_slice.len);
     astgen.extra.appendSliceAssumeCapacity(decls_slice);
-    astgen.appendBodyWithFixups(body);
     astgen.extra.appendSliceAssumeCapacity(fields_slice);
+    astgen.extra.appendSliceAssumeCapacity(bodies_slice);
 
     block_scope.unstack();
     try gz.addNamespaceCaptures(&namespace);
@@ -4457,6 +4511,7 @@ fn containerDecl(
                 var total_fields: usize = 0;
                 var decls: usize = 0;
                 var nonexhaustive_node: Ast.Node.Index = 0;
+                var nonfinal_nonexhaustive = false;
                 for (container_decl.ast.members) |member_node| {
                     const member = switch (node_tags[member_node]) {
                         .container_field_init => tree.containerFieldInit(member_node),
@@ -4508,6 +4563,8 @@ fn containerDecl(
                             return astgen.failNode(member.ast.value_expr, "'_' is used to mark an enum as non-exhaustive and cannot be assigned a value", .{});
                         }
                         continue;
+                    } else if (nonexhaustive_node != 0) {
+                        nonfinal_nonexhaustive = true;
                     }
                     total_fields += 1;
                     if (member.ast.value_expr != 0) {
@@ -4516,6 +4573,9 @@ fn containerDecl(
                         }
                         values += 1;
                     }
+                }
+                if (nonfinal_nonexhaustive) {
+                    return astgen.failNode(nonexhaustive_node, "'_' field of non-exhaustive enum must be last", .{});
                 }
                 break :blk .{
                     .total_fields = total_fields,
@@ -4982,10 +5042,14 @@ fn orelseCatchExpr(
     var err_val_scope: Scope.LocalVal = undefined;
     const else_sub_scope = blk: {
         const payload = payload_token orelse break :blk &else_scope.base;
-        if (mem.eql(u8, tree.tokenSlice(payload), "_")) {
+        const err_str = tree.tokenSlice(payload);
+        if (mem.eql(u8, err_str, "_")) {
             return astgen.failTok(payload, "discard of error capture; omit it instead", .{});
         }
         const err_name = try astgen.identAsString(payload);
+
+        try astgen.detectLocalShadowing(scope, err_name, payload, err_str);
+
         err_val_scope = .{
             .parent = &else_scope.base,
             .gen_zir = &else_scope,
@@ -5139,16 +5203,14 @@ fn arrayAccess(
     const tree = astgen.tree;
     const node_datas = tree.nodes.items(.data);
     switch (rl) {
-        .ref => return gz.addBin(
-            .elem_ptr,
-            try expr(gz, scope, .ref, node_datas[node].lhs),
-            try expr(gz, scope, .{ .ty = .usize_type }, node_datas[node].rhs),
-        ),
-        else => return rvalue(gz, rl, try gz.addBin(
-            .elem_val,
-            try expr(gz, scope, .none, node_datas[node].lhs),
-            try expr(gz, scope, .{ .coerced_ty = .usize_type }, node_datas[node].rhs),
-        ), node),
+        .ref => return gz.addPlNode(.elem_ptr_node, node, Zir.Inst.Bin{
+            .lhs = try expr(gz, scope, .ref, node_datas[node].lhs),
+            .rhs = try expr(gz, scope, .{ .ty = .usize_type }, node_datas[node].rhs),
+        }),
+        else => return rvalue(gz, rl, try gz.addPlNode(.elem_val_node, node, Zir.Inst.Bin{
+            .lhs = try expr(gz, scope, .none, node_datas[node].lhs),
+            .rhs = try expr(gz, scope, .{ .ty = .usize_type }, node_datas[node].rhs),
+        }), node),
     }
 }
 
@@ -5670,7 +5732,7 @@ fn whileExpr(
         try then_scope.addDbgVar(.dbg_var_val, some, dbg_var_inst);
     }
     if (while_full.ast.cont_expr != 0) {
-        _ = try expr(&loop_scope, then_sub_scope, .{ .ty = .void_type }, while_full.ast.cont_expr);
+        _ = try unusedResultExpr(&loop_scope, then_sub_scope, while_full.ast.cont_expr);
     }
     try then_scope.addDbgBlockEnd();
     const repeat_tag: Zir.Inst.Tag = if (is_inline) .repeat_inline else .repeat;
@@ -5733,6 +5795,10 @@ fn whileExpr(
                 break :s &else_scope.base;
             }
         };
+        // Remove the continue block and break block so that `continue` and `break`
+        // control flow apply to outer loops; not this one.
+        loop_scope.continue_block = 0;
+        loop_scope.break_block = 0;
         const e = try expr(&else_scope, sub_scope, loop_scope.break_result_loc, else_node);
         if (!else_scope.endsWithNoReturn()) {
             loop_scope.break_count += 1;
@@ -5875,7 +5941,10 @@ fn forExpr(
         if (!mem.eql(u8, value_name, "_")) {
             const name_str_index = try astgen.identAsString(ident);
             const tag: Zir.Inst.Tag = if (is_ptr) .elem_ptr else .elem_val;
-            const payload_inst = try then_scope.addBin(tag, array_ptr, index);
+            const payload_inst = try then_scope.addPlNode(tag, for_full.ast.cond_expr, Zir.Inst.Bin{
+                .lhs = array_ptr,
+                .rhs = index,
+            });
             try astgen.detectLocalShadowing(&then_scope.base, name_str_index, ident, value_name);
             payload_val_scope = .{
                 .parent = &then_scope.base,
@@ -5929,6 +5998,10 @@ fn forExpr(
         result: Zir.Inst.Ref,
     } = if (else_node != 0) blk: {
         const sub_scope = &else_scope.base;
+        // Remove the continue block and break block so that `continue` and `break`
+        // control flow apply to outer loops; not this one.
+        loop_scope.continue_block = 0;
+        loop_scope.break_block = 0;
         const else_result = try expr(&else_scope, sub_scope, loop_scope.break_result_loc, else_node);
         if (!else_scope.endsWithNoReturn()) {
             loop_scope.break_count += 1;
@@ -7033,7 +7106,7 @@ fn asRlPtr(
     operand_node: Ast.Node.Index,
     dest_type: Zir.Inst.Ref,
 ) InnerError!Zir.Inst.Ref {
-    var as_scope = try parent_gz.makeCoercionScope(scope, dest_type, result_ptr);
+    var as_scope = try parent_gz.makeCoercionScope(scope, dest_type, result_ptr, src_node);
     defer as_scope.unstack();
 
     const result = try reachableExpr(&as_scope, &as_scope.base, .{ .block_ptr = &as_scope }, operand_node, src_node);
@@ -7339,15 +7412,13 @@ fn builtinCall(
         .align_of    => return simpleUnOpType(gz, scope, rl, node, params[0], .align_of),
 
         .ptr_to_int            => return simpleUnOp(gz, scope, rl, node, .none,                               params[0], .ptr_to_int),
-        .error_to_int          => return simpleUnOp(gz, scope, rl, node, .none,                               params[0], .error_to_int),
-        .int_to_error          => return simpleUnOp(gz, scope, rl, node, .{ .coerced_ty = .u16_type },        params[0], .int_to_error),
         .compile_error         => return simpleUnOp(gz, scope, rl, node, .{ .ty = .const_slice_u8_type },     params[0], .compile_error),
         .set_eval_branch_quota => return simpleUnOp(gz, scope, rl, node, .{ .coerced_ty = .u32_type },        params[0], .set_eval_branch_quota),
         .enum_to_int           => return simpleUnOp(gz, scope, rl, node, .none,                               params[0], .enum_to_int),
         .bool_to_int           => return simpleUnOp(gz, scope, rl, node, bool_rl,                             params[0], .bool_to_int),
         .embed_file            => return simpleUnOp(gz, scope, rl, node, .{ .ty = .const_slice_u8_type },     params[0], .embed_file),
         .error_name            => return simpleUnOp(gz, scope, rl, node, .{ .ty = .anyerror_type },           params[0], .error_name),
-        .panic                 => return simpleUnOp(gz, scope, rl, node, .{ .ty = .const_slice_u8_type },     params[0], .panic),
+        .panic                 => return simpleUnOp(gz, scope, rl, node, .{ .ty = .const_slice_u8_type },     params[0], if (gz.force_comptime) .panic_comptime else .panic),
         .set_cold              => return simpleUnOp(gz, scope, rl, node, bool_rl,                             params[0], .set_cold),
         .set_runtime_safety    => return simpleUnOp(gz, scope, rl, node, bool_rl,                             params[0], .set_runtime_safety),
         .sqrt                  => return simpleUnOp(gz, scope, rl, node, .none,                               params[0], .sqrt),
@@ -7380,6 +7451,22 @@ fn builtinCall(
         .truncate     => return typeCast(gz, scope, rl, node, params[0], params[1], .truncate),
         // zig fmt: on
 
+        .error_to_int => {
+            const operand = try expr(gz, scope, .none, params[0]);
+            const result = try gz.addExtendedPayload(.error_to_int, Zir.Inst.UnNode{
+                .node = gz.nodeIndexToRelative(node),
+                .operand = operand,
+            });
+            return rvalue(gz, rl, result, node);
+        },
+        .int_to_error => {
+            const operand = try expr(gz, scope, .{ .coerced_ty = .u16_type }, params[0]);
+            const result = try gz.addExtendedPayload(.int_to_error, Zir.Inst.UnNode{
+                .node = gz.nodeIndexToRelative(node),
+                .operand = operand,
+            });
+            return rvalue(gz, rl, result, node);
+        },
         .align_cast => {
             const dest_align = try comptimeExpr(gz, scope, align_rl, params[0]);
             const rhs = try expr(gz, scope, .none, params[1]);
@@ -7619,7 +7706,8 @@ fn builtinCall(
             return rvalue(gz, rl, result, node);
         },
         .select => {
-            const result = try gz.addPlNode(.select, node, Zir.Inst.Select{
+            const result = try gz.addExtendedPayload(.select, Zir.Inst.Select{
+                .node = gz.nodeIndexToRelative(node),
                 .elem_type = try typeExpr(gz, scope, params[0]),
                 .pred = try expr(gz, scope, .none, params[1]),
                 .a = try expr(gz, scope, .none, params[2]),
@@ -9890,13 +9978,14 @@ const GenZir = struct {
         scope: *Scope,
         dest_type: Zir.Inst.Ref,
         result_ptr: Zir.Inst.Ref,
+        src_node: Ast.Node.Index,
     ) !GenZir {
         // Detect whether this expr() call goes into rvalue() to store the result into the
         // result location. If it does, elide the coerce_result_ptr instruction
         // as well as the store instruction, instead passing the result as an rvalue.
         var as_scope = parent_gz.makeSubBlock(scope);
         errdefer as_scope.unstack();
-        as_scope.rl_ptr = try as_scope.addBin(.coerce_result_ptr, dest_type, result_ptr);
+        as_scope.rl_ptr = try as_scope.addPlNode(.coerce_result_ptr, src_node, Zir.Inst.Bin{ .lhs = dest_type, .rhs = result_ptr });
 
         // `rl_ty_inst` needs to be set in case the stores to `rl_ptr` are eliminated.
         as_scope.rl_ty_inst = dest_type;
@@ -10000,7 +10089,7 @@ const GenZir = struct {
             .inferred_ptr => |ptr| {
                 gz.rl_ty_inst = .none;
                 gz.rl_ptr = ptr;
-                gz.break_result_loc = parent_rl;
+                gz.break_result_loc = .{ .block_ptr = gz };
             },
 
             .block_ptr => |parent_block_scope| {
@@ -10934,7 +11023,6 @@ const GenZir = struct {
 
     fn setStruct(gz: *GenZir, inst: Zir.Inst.Index, args: struct {
         src_node: Ast.Node.Index,
-        body_len: u32,
         fields_len: u32,
         decls_len: u32,
         layout: std.builtin.Type.ContainerLayout,
@@ -10951,9 +11039,6 @@ const GenZir = struct {
             const node_offset = gz.nodeIndexToRelative(args.src_node);
             astgen.extra.appendAssumeCapacity(@bitCast(u32, node_offset));
         }
-        if (args.body_len != 0) {
-            astgen.extra.appendAssumeCapacity(args.body_len);
-        }
         if (args.fields_len != 0) {
             astgen.extra.appendAssumeCapacity(args.fields_len);
         }
@@ -10966,7 +11051,6 @@ const GenZir = struct {
                 .opcode = .struct_decl,
                 .small = @bitCast(u16, Zir.Inst.StructDecl.Small{
                     .has_src_node = args.src_node != 0,
-                    .has_body_len = args.body_len != 0,
                     .has_fields_len = args.fields_len != 0,
                     .has_decls_len = args.decls_len != 0,
                     .known_non_opv = args.known_non_opv,

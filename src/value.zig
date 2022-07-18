@@ -111,6 +111,7 @@ pub const Value = extern union {
         int_i64,
         int_big_positive,
         int_big_negative,
+        runtime_int,
         function,
         extern_fn,
         variable,
@@ -304,6 +305,7 @@ pub const Value = extern union {
                 .int_type => Payload.IntType,
                 .int_u64 => Payload.U64,
                 .int_i64 => Payload.I64,
+                .runtime_int => Payload.U64,
                 .function => Payload.Function,
                 .variable => Payload.Variable,
                 .decl_ref_mut => Payload.DeclRefMut,
@@ -483,6 +485,7 @@ pub const Value = extern union {
             },
             .int_type => return self.copyPayloadShallow(arena, Payload.IntType),
             .int_u64 => return self.copyPayloadShallow(arena, Payload.U64),
+            .runtime_int => return self.copyPayloadShallow(arena, Payload.U64),
             .int_i64 => return self.copyPayloadShallow(arena, Payload.I64),
             .int_big_positive, .int_big_negative => {
                 const old_payload = self.cast(Payload.BigInt).?;
@@ -762,6 +765,7 @@ pub const Value = extern union {
             .int_i64 => return std.fmt.formatIntValue(val.castTag(.int_i64).?.data, "", options, out_stream),
             .int_big_positive => return out_stream.print("{}", .{val.castTag(.int_big_positive).?.asBigInt()}),
             .int_big_negative => return out_stream.print("{}", .{val.castTag(.int_big_negative).?.asBigInt()}),
+            .runtime_int => return out_stream.writeAll("[runtime value]"),
             .function => return out_stream.print("(function decl={d})", .{val.castTag(.function).?.data.owner_decl}),
             .extern_fn => return out_stream.writeAll("(extern function)"),
             .variable => return out_stream.writeAll("(variable)"),
@@ -1062,6 +1066,7 @@ pub const Value = extern union {
         sema_kit: ?Module.WipAnalysis,
     ) Module.CompileError!BigIntConst {
         switch (val.tag()) {
+            .null_value,
             .zero,
             .bool_false,
             .the_only_possible_value, // i0, u0
@@ -1075,6 +1080,8 @@ pub const Value = extern union {
             .int_i64 => return BigIntMutable.init(&space.limbs, val.castTag(.int_i64).?.data).toConst(),
             .int_big_positive => return val.castTag(.int_big_positive).?.asBigInt(),
             .int_big_negative => return val.castTag(.int_big_negative).?.asBigInt(),
+
+            .runtime_int => return BigIntMutable.init(&space.limbs, val.castTag(.runtime_int).?.data).toConst(),
 
             .undef => unreachable,
 
@@ -1130,6 +1137,8 @@ pub const Value = extern union {
             .int_i64 => return @intCast(u64, val.castTag(.int_i64).?.data),
             .int_big_positive => return val.castTag(.int_big_positive).?.asBigInt().to(u64) catch null,
             .int_big_negative => return val.castTag(.int_big_negative).?.asBigInt().to(u64) catch null,
+
+            .runtime_int => return val.castTag(.runtime_int).?.data,
 
             .undef => unreachable,
 
@@ -1282,11 +1291,11 @@ pub const Value = extern union {
             const field_val = field_vals[i];
             const field_bigint_const = switch (field.ty.zigTypeTag()) {
                 .Float => switch (field.ty.floatBits(target)) {
-                    16 => bitcastFloatToBigInt(f16, val.toFloat(f16), &field_buf),
-                    32 => bitcastFloatToBigInt(f32, val.toFloat(f32), &field_buf),
-                    64 => bitcastFloatToBigInt(f64, val.toFloat(f64), &field_buf),
-                    80 => bitcastFloatToBigInt(f80, val.toFloat(f80), &field_buf),
-                    128 => bitcastFloatToBigInt(f128, val.toFloat(f128), &field_buf),
+                    16 => bitcastFloatToBigInt(f16, field_val.toFloat(f16), &field_buf),
+                    32 => bitcastFloatToBigInt(f32, field_val.toFloat(f32), &field_buf),
+                    64 => bitcastFloatToBigInt(f64, field_val.toFloat(f64), &field_buf),
+                    80 => bitcastFloatToBigInt(f80, field_val.toFloat(f80), &field_buf),
+                    128 => bitcastFloatToBigInt(f128, field_val.toFloat(f128), &field_buf),
                     else => unreachable,
                 },
                 .Int, .Bool => field_val.toBigInt(&field_space, target),
@@ -1459,8 +1468,7 @@ pub const Value = extern union {
             const repr = std.math.break_f80(f);
             std.mem.writeInt(u64, buffer[0..8], repr.fraction, endian);
             std.mem.writeInt(u16, buffer[8..10], repr.exp, endian);
-            // TODO set the rest of the bytes to undefined. should we use 0xaa
-            // or is there a different way?
+            std.mem.set(u8, buffer[10..], 0);
             return;
         }
         const Int = @Type(.{ .Int = .{
@@ -1472,20 +1480,18 @@ pub const Value = extern union {
     }
 
     fn floatReadFromMemory(comptime F: type, target: Target, buffer: []const u8) F {
+        const endian = target.cpu.arch.endian();
         if (F == f80) {
-            switch (target.cpu.arch) {
-                .i386, .x86_64 => return std.math.make_f80(.{
-                    .fraction = std.mem.readIntLittle(u64, buffer[0..8]),
-                    .exp = std.mem.readIntLittle(u16, buffer[8..10]),
-                }),
-                else => {},
-            }
+            return std.math.make_f80(.{
+                .fraction = readInt(u64, buffer[0..8], endian),
+                .exp = readInt(u16, buffer[8..10], endian),
+            });
         }
         const Int = @Type(.{ .Int = .{
             .signedness = .unsigned,
             .bits = @typeInfo(F).Float.bits,
         } });
-        const int = readInt(Int, buffer[0..@sizeOf(Int)], target.cpu.arch.endian());
+        const int = readInt(Int, buffer[0..@sizeOf(Int)], endian);
         return @bitCast(F, int);
     }
 
@@ -2185,15 +2191,28 @@ pub const Value = extern union {
                 // A tuple can be represented with .empty_struct_value,
                 // the_one_possible_value, .aggregate in which case we could
                 // end up here and the values are equal if the type has zero fields.
-                return ty.structFieldCount() != 0;
+                return ty.isTupleOrAnonStruct() and ty.structFieldCount() != 0;
             },
             .Float => {
-                const a_nan = a.isNan();
-                const b_nan = b.isNan();
-                if (a_nan or b_nan) {
-                    return a_nan and b_nan;
+                switch (ty.floatBits(target)) {
+                    16 => return @bitCast(u16, a.toFloat(f16)) == @bitCast(u16, b.toFloat(f16)),
+                    32 => return @bitCast(u32, a.toFloat(f32)) == @bitCast(u32, b.toFloat(f32)),
+                    64 => return @bitCast(u64, a.toFloat(f64)) == @bitCast(u64, b.toFloat(f64)),
+                    80 => return @bitCast(u80, a.toFloat(f80)) == @bitCast(u80, b.toFloat(f80)),
+                    128 => return @bitCast(u128, a.toFloat(f128)) == @bitCast(u128, b.toFloat(f128)),
+                    else => unreachable,
                 }
-                return order(a, b, target).compare(.eq);
+            },
+            .ComptimeFloat => {
+                const a_float = a.toFloat(f128);
+                const b_float = b.toFloat(f128);
+
+                const a_nan = std.math.isNan(a_float);
+                const b_nan = std.math.isNan(b_float);
+                if (a_nan != b_nan) return false;
+                if (std.math.signbit(a_float) != std.math.signbit(b_float)) return false;
+                if (a_nan) return true;
+                return a_float == b_float;
             },
             .Optional => {
                 if (a.tag() != .opt_payload and b.tag() == .opt_payload) {
@@ -2230,18 +2249,25 @@ pub const Value = extern union {
                 var buf: ToTypeBuffer = undefined;
                 return val.toType(&buf).hashWithHasher(hasher, mod);
             },
-            .Float, .ComptimeFloat => {
-                // Normalize the float here because this hash must match eql semantics.
-                // These functions are used for hash maps so we want NaN to equal itself,
-                // and -0.0 to equal +0.0.
+            .Float => {
+                // For hash/eql purposes, we treat floats as their IEEE integer representation.
+                switch (ty.floatBits(mod.getTarget())) {
+                    16 => std.hash.autoHash(hasher, @bitCast(u16, val.toFloat(f16))),
+                    32 => std.hash.autoHash(hasher, @bitCast(u32, val.toFloat(f32))),
+                    64 => std.hash.autoHash(hasher, @bitCast(u64, val.toFloat(f64))),
+                    80 => std.hash.autoHash(hasher, @bitCast(u80, val.toFloat(f80))),
+                    128 => std.hash.autoHash(hasher, @bitCast(u128, val.toFloat(f128))),
+                    else => unreachable,
+                }
+            },
+            .ComptimeFloat => {
                 const float = val.toFloat(f128);
-                if (std.math.isNan(float)) {
-                    std.hash.autoHash(hasher, std.math.nan_u128);
-                } else if (float == 0.0) {
-                    var normalized_zero: f128 = 0.0;
-                    std.hash.autoHash(hasher, @bitCast(u128, normalized_zero));
-                } else {
+                const is_nan = std.math.isNan(float);
+                std.hash.autoHash(hasher, is_nan);
+                if (!is_nan) {
                     std.hash.autoHash(hasher, @bitCast(u128, float));
+                } else {
+                    std.hash.autoHash(hasher, std.math.signbit(float));
                 }
             },
             .Bool, .Int, .ComptimeInt, .Pointer => switch (val.tag()) {
@@ -2413,6 +2439,7 @@ pub const Value = extern union {
                 return false;
             },
             .@"union" => return val.cast(Payload.Union).?.data.val.canMutateComptimeVarState(),
+            .slice => return val.castTag(.slice).?.data.ptr.canMutateComptimeVarState(),
             else => return false,
         }
     }
@@ -4768,7 +4795,7 @@ pub const Value = extern union {
 
             pub const Data = struct {
                 decl_index: Module.Decl.Index,
-                runtime_index: u32,
+                runtime_index: RuntimeIndex,
             };
         };
 
@@ -4908,7 +4935,16 @@ pub const Value = extern union {
                 /// peer type resolution. This is stored in a separate list so that
                 /// the items are contiguous in memory and thus can be passed to
                 /// `Module.resolvePeerTypes`.
-                stored_inst_list: std.ArrayListUnmanaged(Air.Inst.Ref) = .{},
+                prongs: std.MultiArrayList(struct {
+                    /// The dummy instruction used as a peer to resolve the type.
+                    /// Although this has a redundant type with placeholder, this is
+                    /// needed in addition because it may be a constant value, which
+                    /// affects peer type resolution.
+                    stored_inst: Air.Inst.Ref,
+                    /// The bitcast instruction used as a placeholder when the
+                    /// new result pointer type is not yet known.
+                    placeholder: Air.Inst.Index,
+                }) = .{},
                 /// 0 means ABI-aligned.
                 alignment: u32,
             },
@@ -4965,6 +5001,16 @@ pub const Value = extern union {
     pub fn makeBool(x: bool) Value {
         return if (x) Value.@"true" else Value.@"false";
     }
+
+    pub const RuntimeIndex = enum(u32) {
+        zero = 0,
+        comptime_field_ptr = std.math.maxInt(u32),
+        _,
+
+        pub fn increment(ri: *RuntimeIndex) void {
+            ri.* = @intToEnum(RuntimeIndex, @enumToInt(ri.*) + 1);
+        }
+    };
 };
 
 var negative_one_payload: Value.Payload.I64 = .{

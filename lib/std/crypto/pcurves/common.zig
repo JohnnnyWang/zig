@@ -203,19 +203,17 @@ pub fn Field(comptime params: FieldParams) type {
             const XLimbs = [a.limbs.len + 1]Word;
 
             var d: Word = 1;
-            var f: XLimbs = undefined;
-            fiat.msat(&f);
-
+            var f = comptime blk: {
+                var f: XLimbs = undefined;
+                fiat.msat(&f);
+                break :blk f;
+            };
             var g: XLimbs = undefined;
             fiat.fromMontgomery(g[0..a.limbs.len], a.limbs);
             g[g.len - 1] = 0;
 
-            var r: Limbs = undefined;
-            fiat.setOne(&r);
-            var v = mem.zeroes(Limbs);
-
-            var precomp: Limbs = undefined;
-            fiat.divstepPrecomp(&precomp);
+            var r = Fe.one.limbs;
+            var v = Fe.zero.limbs;
 
             var out1: Word = undefined;
             var out2: XLimbs = undefined;
@@ -236,6 +234,12 @@ pub fn Field(comptime params: FieldParams) type {
             var v_opp: Limbs = undefined;
             fiat.opp(&v_opp, v);
             fiat.selectznz(&v, @truncate(u1, f[f.len - 1] >> (@bitSizeOf(Word) - 1)), v, v_opp);
+
+            const precomp = blk: {
+                var precomp: Limbs = undefined;
+                fiat.divstepPrecomp(&precomp);
+                break :blk precomp;
+            };
             var fe: Fe = undefined;
             fiat.mul(&fe.limbs, v, precomp);
             return fe;
@@ -291,6 +295,17 @@ pub fn Field(comptime params: FieldParams) type {
                 const x63 = x32.sqn(31).mul(x31);
                 const x126 = x63.sqn(63).mul(x63);
                 return x126.sqn(126).mul(x126).sqn(3).mul(t111).sqn(33).mul(x32).sqn(64).mul(x2).sqn(30);
+            } else if (field_order == 115792089237316195423570985008687907853269984665640564039457584007908834671663) {
+                const t11 = x2.mul(x2.sq());
+                const t1111 = t11.mul(t11.sqn(2));
+                const t11111 = x2.mul(t1111.sq());
+                const t1111111 = t11.mul(t11111.sqn(2));
+                const x11 = t1111111.sqn(4).mul(t1111);
+                const x22 = x11.sqn(11).mul(x11);
+                const x27 = x22.sqn(5).mul(t11111);
+                const x54 = x27.sqn(27).mul(x27);
+                const x108 = x54.sqn(54).mul(x54);
+                return x108.sqn(108).mul(x108).sqn(7).mul(t1111111).sqn(23).mul(x22).sqn(6).mul(t11).sqn(2);
             } else {
                 return x2.pow(std.meta.Int(.unsigned, field_bits), (field_order + 1) / 4);
             }

@@ -1,11 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const Allocator = std.mem.Allocator;
+const CrossTarget = std.zig.CrossTarget;
+const print = std.debug.print;
+const assert = std.debug.assert;
+
 const link = @import("link.zig");
 const Compilation = @import("Compilation.zig");
-const Allocator = std.mem.Allocator;
 const Package = @import("Package.zig");
 const introspect = @import("introspect.zig");
 const build_options = @import("build_options");
+const ThreadPool = @import("ThreadPool.zig");
+const WaitGroup = @import("WaitGroup.zig");
+const zig_h = link.File.C.zig_h;
+
 const enable_qemu: bool = build_options.enable_qemu;
 const enable_wine: bool = build_options.enable_wine;
 const enable_wasmtime: bool = build_options.enable_wasmtime;
@@ -13,12 +21,6 @@ const enable_darling: bool = build_options.enable_darling;
 const enable_rosetta: bool = build_options.enable_rosetta;
 const glibc_runtimes_dir: ?[]const u8 = build_options.glibc_runtimes_dir;
 const skip_stage1 = build_options.skip_stage1;
-const ThreadPool = @import("ThreadPool.zig");
-const CrossTarget = std.zig.CrossTarget;
-const print = std.debug.print;
-const assert = std.debug.assert;
-
-const zig_h = link.File.C.zig_h;
 
 const hr = "=" ** 80;
 
@@ -27,11 +29,24 @@ test {
         @import("stage1.zig").os_init();
     }
 
-    var arena_allocator = std.heap.ArenaAllocator.init(std.testing.allocator);
+    const use_gpa = build_options.force_gpa or !builtin.link_libc;
+    const gpa = gpa: {
+        if (use_gpa) {
+            break :gpa std.testing.allocator;
+        }
+        // We would prefer to use raw libc allocator here, but cannot
+        // use it if it won't support the alignment we need.
+        if (@alignOf(std.c.max_align_t) < @alignOf(i128)) {
+            break :gpa std.heap.c_allocator;
+        }
+        break :gpa std.heap.raw_c_allocator;
+    };
+
+    var arena_allocator = std.heap.ArenaAllocator.init(gpa);
     defer arena_allocator.deinit();
     const arena = arena_allocator.allocator();
 
-    var ctx = TestContext.init(std.testing.allocator, arena);
+    var ctx = TestContext.init(gpa, arena);
     defer ctx.deinit();
 
     {
@@ -39,7 +54,7 @@ test {
             std.fs.path.dirname(@src().file).?, "..", "test", "cases",
         });
 
-        var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+        var dir = try std.fs.cwd().openIterableDir(dir_path, .{});
         defer dir.close();
 
         ctx.addTestCasesFromDir(dir);
@@ -220,9 +235,9 @@ const TestManifest = struct {
             inner: std.mem.SplitIterator(u8),
             parse_fn: ParseFn(T),
 
-            fn next(self: *@This()) ?T {
+            fn next(self: *@This()) !?T {
                 const next_raw = self.inner.next() orelse return null;
-                return self.parse_fn(next_raw);
+                return try self.parse_fn(next_raw);
             }
         };
     }
@@ -324,20 +339,20 @@ const TestManifest = struct {
         allocator: Allocator,
         key: []const u8,
         comptime T: type,
-    ) error{OutOfMemory}![]const T {
+    ) ![]const T {
         var out = std.ArrayList(T).init(allocator);
         defer out.deinit();
         var it = self.getConfigForKey(key, T);
-        while (it.next()) |item| {
+        while (try it.next()) |item| {
             try out.append(item);
         }
         return out.toOwnedSlice();
     }
 
-    fn getConfigForKeyAssertSingle(self: TestManifest, key: []const u8, comptime T: type) T {
+    fn getConfigForKeyAssertSingle(self: TestManifest, key: []const u8, comptime T: type) !T {
         var it = self.getConfigForKey(key, T);
-        const res = it.next().?;
-        assert(it.next() == null);
+        const res = (try it.next()) orelse unreachable;
+        assert((try it.next()) == null);
         return res;
     }
 
@@ -358,33 +373,36 @@ const TestManifest = struct {
     }
 
     fn ParseFn(comptime T: type) type {
-        return fn ([]const u8) ?T;
+        return fn ([]const u8) anyerror!T;
     }
 
     fn getDefaultParser(comptime T: type) ParseFn(T) {
         switch (@typeInfo(T)) {
             .Int => return struct {
-                fn parse(str: []const u8) ?T {
-                    return std.fmt.parseInt(T, str, 0) catch null;
+                fn parse(str: []const u8) anyerror!T {
+                    return try std.fmt.parseInt(T, str, 0);
                 }
             }.parse,
             .Bool => return struct {
-                fn parse(str: []const u8) ?T {
-                    const as_int = std.fmt.parseInt(u1, str, 0) catch return null;
+                fn parse(str: []const u8) anyerror!T {
+                    const as_int = try std.fmt.parseInt(u1, str, 0);
                     return as_int > 0;
                 }
             }.parse,
             .Enum => return struct {
-                fn parse(str: []const u8) ?T {
-                    return std.meta.stringToEnum(T, str);
+                fn parse(str: []const u8) anyerror!T {
+                    return std.meta.stringToEnum(T, str) orelse {
+                        std.log.err("unknown enum variant for {s}: {s}", .{ @typeName(T), str });
+                        return error.UnknownEnumVariant;
+                    };
                 }
             }.parse,
             .Struct => if (comptime std.mem.eql(u8, @typeName(T), "CrossTarget")) return struct {
-                fn parse(str: []const u8) ?T {
+                fn parse(str: []const u8) anyerror!T {
                     var opts = CrossTarget.ParseOptions{
                         .arch_os_abi = str,
                     };
-                    return CrossTarget.parse(opts) catch null;
+                    return try CrossTarget.parse(opts);
                 }
             }.parse else @compileError("no default parser for " ++ @typeName(T)),
             else => @compileError("no default parser for " ++ @typeName(T)),
@@ -536,6 +554,7 @@ fn sortTestFilenames(filenames: [][]const u8) void {
 }
 
 pub const TestContext = struct {
+    gpa: Allocator,
     arena: Allocator,
     cases: std.ArrayList(Case),
 
@@ -603,6 +622,8 @@ pub const TestContext = struct {
         link_libc: bool = false,
 
         files: std.ArrayList(File),
+
+        result: anyerror!void = {},
 
         pub fn addSourceFile(case: *Case, name: []const u8, src: [:0]const u8) void {
             case.files.append(.{ .path = name, .src = src }) catch @panic("out of memory");
@@ -1059,7 +1080,7 @@ pub const TestContext = struct {
     /// Each file should include a test manifest as a contiguous block of comments at
     /// the end of the file. The first line should be the test type, followed by a set of
     /// key-value config values, followed by a blank line, then the expected output.
-    pub fn addTestCasesFromDir(ctx: *TestContext, dir: std.fs.Dir) void {
+    pub fn addTestCasesFromDir(ctx: *TestContext, dir: std.fs.IterableDir) void {
         var current_file: []const u8 = "none";
         ctx.addTestCasesFromDirInner(dir, &current_file) catch |err| {
             std.debug.panic("test harness failed to process file '{s}': {s}\n", .{
@@ -1070,12 +1091,12 @@ pub const TestContext = struct {
 
     fn addTestCasesFromDirInner(
         ctx: *TestContext,
-        dir: std.fs.Dir,
+        iterable_dir: std.fs.IterableDir,
         /// This is kept up to date with the currently being processed file so
         /// that if any errors occur the caller knows it happened during this file.
         current_file: *[]const u8,
     ) !void {
-        var it = try dir.walk(ctx.arena);
+        var it = try iterable_dir.walk(ctx.arena);
         var filenames = std.ArrayList([]const u8).init(ctx.arena);
 
         while (try it.next()) |entry| {
@@ -1102,7 +1123,7 @@ pub const TestContext = struct {
                 current_file.* = filename;
 
                 const max_file_size = 10 * 1024 * 1024;
-                const src = try dir.readFileAllocOptions(ctx.arena, filename, max_file_size, null, 1, 0);
+                const src = try iterable_dir.dir.readFileAllocOptions(ctx.arena, filename, max_file_size, null, 1, 0);
 
                 // Parse the manifest
                 var manifest = try TestManifest.parse(ctx.arena, src);
@@ -1110,8 +1131,8 @@ pub const TestContext = struct {
                 if (cases.items.len == 0) {
                     const backends = try manifest.getConfigForKeyAlloc(ctx.arena, "backend", Backend);
                     const targets = try manifest.getConfigForKeyAlloc(ctx.arena, "target", CrossTarget);
-                    const is_test = manifest.getConfigForKeyAssertSingle("is_test", bool);
-                    const output_mode = manifest.getConfigForKeyAssertSingle("output_mode", std.builtin.OutputMode);
+                    const is_test = try manifest.getConfigForKeyAssertSingle("is_test", bool);
+                    const output_mode = try manifest.getConfigForKeyAssertSingle("output_mode", std.builtin.OutputMode);
 
                     const name_prefix = blk: {
                         const ext_index = std.mem.lastIndexOfScalar(u8, current_file.*, '.') orelse
@@ -1185,6 +1206,7 @@ pub const TestContext = struct {
 
     fn init(gpa: Allocator, arena: Allocator) TestContext {
         return .{
+            .gpa = gpa,
             .cases = std.ArrayList(Case).init(gpa),
             .arena = arena,
         };
@@ -1204,19 +1226,23 @@ pub const TestContext = struct {
     }
 
     fn run(self: *TestContext) !void {
-        const host = try std.zig.system.NativeTargetInfo.detect(std.testing.allocator, .{});
+        const host = try std.zig.system.NativeTargetInfo.detect(self.gpa, .{});
 
         var progress = std.Progress{};
         const root_node = progress.start("compiler", self.cases.items.len);
         defer root_node.end();
 
-        var zig_lib_directory = try introspect.findZigLibDir(std.testing.allocator);
+        var zig_lib_directory = try introspect.findZigLibDir(self.gpa);
         defer zig_lib_directory.handle.close();
-        defer std.testing.allocator.free(zig_lib_directory.path.?);
+        defer self.gpa.free(zig_lib_directory.path.?);
 
-        var thread_pool: ThreadPool = undefined;
-        try thread_pool.init(std.testing.allocator);
-        defer thread_pool.deinit();
+        var aux_thread_pool: ThreadPool = undefined;
+        try aux_thread_pool.init(self.gpa);
+        defer aux_thread_pool.deinit();
+
+        var case_thread_pool: ThreadPool = undefined;
+        try case_thread_pool.init(self.gpa);
+        defer case_thread_pool.deinit();
 
         // Use the same global cache dir for all the tests, such that we for example don't have to
         // rebuild musl libc for every case (when LLVM backend is enabled).
@@ -1225,58 +1251,88 @@ pub const TestContext = struct {
 
         var cache_dir = try global_tmp.dir.makeOpenPath("zig-cache", .{});
         defer cache_dir.close();
-        const tmp_dir_path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ ".", "zig-cache", "tmp", &global_tmp.sub_path });
-        defer std.testing.allocator.free(tmp_dir_path);
+        const tmp_dir_path = try std.fs.path.join(self.gpa, &[_][]const u8{ ".", "zig-cache", "tmp", &global_tmp.sub_path });
+        defer self.gpa.free(tmp_dir_path);
 
         const global_cache_directory: Compilation.Directory = .{
             .handle = cache_dir,
-            .path = try std.fs.path.join(std.testing.allocator, &[_][]const u8{ tmp_dir_path, "zig-cache" }),
+            .path = try std.fs.path.join(self.gpa, &[_][]const u8{ tmp_dir_path, "zig-cache" }),
         };
-        defer std.testing.allocator.free(global_cache_directory.path.?);
+        defer self.gpa.free(global_cache_directory.path.?);
+
+        {
+            var wait_group: WaitGroup = .{};
+            defer wait_group.wait();
+
+            for (self.cases.items) |*case| {
+                if (build_options.skip_non_native) {
+                    if (case.target.getCpuArch() != builtin.cpu.arch)
+                        continue;
+                    if (case.target.getObjectFormat() != builtin.object_format)
+                        continue;
+                }
+
+                // Skip tests that require LLVM backend when it is not available
+                if (!build_options.have_llvm and case.backend == .llvm)
+                    continue;
+
+                if (build_options.test_filter) |test_filter| {
+                    if (std.mem.indexOf(u8, case.name, test_filter) == null) continue;
+                }
+
+                wait_group.start();
+                try case_thread_pool.spawn(workerRunOneCase, .{
+                    self.gpa,
+                    root_node,
+                    case,
+                    zig_lib_directory,
+                    &aux_thread_pool,
+                    global_cache_directory,
+                    host,
+                    &wait_group,
+                });
+            }
+        }
 
         var fail_count: usize = 0;
-
-        for (self.cases.items) |case| {
-            if (build_options.skip_non_native) {
-                if (case.target.getCpuArch() != builtin.cpu.arch)
-                    continue;
-                if (case.target.getObjectFormat() != builtin.object_format)
-                    continue;
-            }
-
-            // Skip tests that require LLVM backend when it is not available
-            if (!build_options.have_llvm and case.backend == .llvm)
-                continue;
-
-            if (build_options.test_filter) |test_filter| {
-                if (std.mem.indexOf(u8, case.name, test_filter) == null) continue;
-            }
-            var prg_node = root_node.start(case.name, case.updates.items.len);
-            prg_node.activate();
-            defer prg_node.end();
-
-            // So that we can see which test case failed when the leak checker goes off,
-            // or there's an internal error
-            progress.initial_delay_ns = 0;
-            progress.refresh_rate_ns = 0;
-
-            runOneCase(
-                std.testing.allocator,
-                &prg_node,
-                case,
-                zig_lib_directory,
-                &thread_pool,
-                global_cache_directory,
-                host,
-            ) catch |err| {
+        for (self.cases.items) |*case| {
+            case.result catch |err| {
                 fail_count += 1;
-                print("test '{s}' failed: {s}\n\n", .{ case.name, @errorName(err) });
+                print("{s} failed: {s}\n", .{ case.name, @errorName(err) });
             };
         }
+
         if (fail_count != 0) {
             print("{d} tests failed\n", .{fail_count});
             return error.TestFailed;
         }
+    }
+
+    fn workerRunOneCase(
+        gpa: Allocator,
+        root_node: *std.Progress.Node,
+        case: *Case,
+        zig_lib_directory: Compilation.Directory,
+        thread_pool: *ThreadPool,
+        global_cache_directory: Compilation.Directory,
+        host: std.zig.system.NativeTargetInfo,
+        wait_group: *WaitGroup,
+    ) void {
+        defer wait_group.finish();
+
+        var prg_node = root_node.start(case.name, case.updates.items.len);
+        prg_node.activate();
+        defer prg_node.end();
+
+        case.result = runOneCase(
+            gpa,
+            &prg_node,
+            case.*,
+            zig_lib_directory,
+            thread_pool,
+            global_cache_directory,
+            host,
+        );
     }
 
     fn runOneCase(
@@ -1367,6 +1423,11 @@ pub const TestContext = struct {
 
             try zig_args.append("-O");
             try zig_args.append(@tagName(case.optimize_mode));
+
+            // Prevent sub-process progress bar from interfering with the
+            // one in this parent process.
+            try zig_args.append("--color");
+            try zig_args.append("off");
 
             const result = try std.ChildProcess.exec(.{
                 .allocator = arena,
@@ -1529,6 +1590,8 @@ pub const TestContext = struct {
             .use_llvm = use_llvm,
             .use_stage1 = null, // We already handled stage1 tests
             .self_exe_path = std.testing.zig_exe_path,
+            // TODO instead of turning off color, pass in a std.Progress.Node
+            .color = .off,
         });
         defer comp.destroy();
 
@@ -1627,12 +1690,25 @@ pub const TestContext = struct {
                                         tmp_dir_path_plus_slash,
                                     );
 
+                                    var buf: [1024]u8 = undefined;
+                                    const rendered_msg = blk: {
+                                        var msg: Compilation.AllErrors.Message = actual_error;
+                                        msg.src.src_path = case_msg.src.src_path;
+                                        msg.src.notes = &.{};
+                                        var fib = std.io.fixedBufferStream(&buf);
+                                        try msg.renderToWriter(.no_color, fib.writer(), "error", .Red, 0);
+                                        var it = std.mem.split(u8, fib.getWritten(), "error: ");
+                                        _ = it.next();
+                                        const rendered = it.rest();
+                                        break :blk rendered[0 .. rendered.len - 1]; // trim final newline
+                                    };
+
                                     if (src_path_ok and
                                         (case_msg.src.line == std.math.maxInt(u32) or
                                         actual_msg.line == case_msg.src.line) and
                                         (case_msg.src.column == std.math.maxInt(u32) or
                                         actual_msg.column == case_msg.src.column) and
-                                        std.mem.eql(u8, expected_msg, actual_msg.msg) and
+                                        std.mem.eql(u8, expected_msg, rendered_msg) and
                                         case_msg.src.kind == .@"error" and
                                         actual_msg.count == case_msg.src.count)
                                     {
@@ -1740,9 +1816,16 @@ pub const TestContext = struct {
                         exec_node.activate();
                         defer exec_node.end();
 
-                        // We use relative to cwd here because we pass a new cwd to the
-                        // child process.
-                        const exe_path = try std.fmt.allocPrint(arena, "." ++ std.fs.path.sep_str ++ "{s}", .{bin_name});
+                        // We go out of our way here to use the unique temporary directory name in
+                        // the exe_path so that it makes its way into the cache hash, avoiding
+                        // cache collisions from multiple threads doing `zig run` at the same time
+                        // on the same test_case.c input filename.
+                        const ss = std.fs.path.sep_str;
+                        const exe_path = try std.fmt.allocPrint(
+                            arena,
+                            ".." ++ ss ++ "{s}" ++ ss ++ "{s}",
+                            .{ &tmp.sub_path, bin_name },
+                        );
                         if (case.object_format != null and case.object_format.? == .c) {
                             if (host.getExternalExecutor(target_info, .{ .link_libc = true }) != .native) {
                                 // We wouldn't be able to run the compiled C code.
@@ -1820,18 +1903,31 @@ pub const TestContext = struct {
 
                         try comp.makeBinFileExecutable();
 
-                        break :x std.ChildProcess.exec(.{
-                            .allocator = allocator,
-                            .argv = argv.items,
-                            .cwd_dir = tmp.dir,
-                            .cwd = tmp_dir_path,
-                        }) catch |err| {
-                            print("\nupdate_index={d} The following command failed with {s}:\n", .{
-                                update_index, @errorName(err),
-                            });
-                            dumpArgs(argv.items);
-                            return error.ChildProcessExecution;
-                        };
+                        while (true) {
+                            break :x std.ChildProcess.exec(.{
+                                .allocator = allocator,
+                                .argv = argv.items,
+                                .cwd_dir = tmp.dir,
+                                .cwd = tmp_dir_path,
+                            }) catch |err| switch (err) {
+                                error.FileBusy => {
+                                    // There is a fundamental design flaw in Unix systems with how
+                                    // ETXTBSY interacts with fork+exec.
+                                    // https://github.com/golang/go/issues/22315
+                                    // https://bugs.openjdk.org/browse/JDK-8068370
+                                    // Unfortunately, this could be a real error, but we can't
+                                    // tell the difference here.
+                                    continue;
+                                },
+                                else => {
+                                    print("\n{s}.{d} The following command failed with {s}:\n", .{
+                                        case.name, update_index, @errorName(err),
+                                    });
+                                    dumpArgs(argv.items);
+                                    return error.ChildProcessExecution;
+                                },
+                            };
+                        }
                     };
                     var test_node = update_node.start("test", 0);
                     test_node.activate();
